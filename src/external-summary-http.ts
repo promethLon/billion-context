@@ -270,9 +270,11 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                 signal.throwIfAborted();
                 let dispatched;
                 try {
+                    // Summary targets have their own HTTP route and credentials.
+                    // Keep these requests outside the conversation's scoped transport.
                     dispatched = await fetchWithTimeout(plan.url, {
                         method: "POST", headers: plan.headers, body, redirect: "manual", dispatcher: proxyDispatcher(plan.proxyUrl),
-                    }, undefined, signal);
+                    }, undefined, signal, /* forceDirect */ true);
                 } catch (error) {
                     // #4833: the signal handed to us is the executor's per-attempt
                     // controller — read its ABORT PROVENANCE instead of assuming every

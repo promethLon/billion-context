@@ -3,6 +3,7 @@ import http from "node:http";
 import { afterEach, test } from "node:test";
 import { ExternalSummaryExecutor, type SummaryWork } from "../src/external-summary.ts";
 import { createSummaryHttpCandidate, _setSummaryRetryDelayForTest, _summaryRetryDelaysForTest, type SummaryHttpTarget } from "../src/external-summary-http.ts";
+import { markWsLaneTransport, withFetchTransport } from "../src/fetch-transport.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import { setLogCapture } from "../src/logger.ts";
 import type { PreflightProtocol } from "../src/preflight.ts";
@@ -52,6 +53,32 @@ async function upstream(handler: (req: http.IncomingMessage, res: http.ServerRes
 
 function target(url: string, protocol: PreflightProtocol = "responses", stream = false): SummaryHttpTarget {
     return { url, protocol, model: "external-test-model", headers: { authorization: "Bearer test-summary-key" }, stream };
+}
+
+for (const [protocol, path] of [["openai", "/v1/chat/completions"], ["responses", "/v1/responses"]] as const) {
+    test(`external summary HTTP: ${protocol} bypasses the active Responses WebSocket transport`, async () => {
+        let receivedPath: string | undefined;
+        const intercepted: string[] = [];
+        const mainResponse = new Response("main conversation");
+        const websocketTransport = markWsLaneTransport(async (url) => {
+            intercepted.push(url);
+            return mainResponse;
+        });
+
+        await upstream((req, res) => {
+            receivedPath = req.url;
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify(completion(protocol)));
+        }, async (url) => {
+            const candidate = createSummaryHttpCandidate(target(url + path, protocol), 4096);
+            const result = await withFetchTransport(websocketTransport, () =>
+                new ExternalSummaryExecutor(1).execute(work, [candidate], budget));
+            assert.deepEqual(intercepted, [], "the summary must not use the main conversation transport");
+            assert.equal(receivedPath, path);
+            assert.equal(result.status, "success");
+            if (result.status === "success") assert.equal(result.summary, summary);
+        });
+    });
 }
 
 for (const protocol of ["responses", "anthropic", "openai", "google"] as const) {
