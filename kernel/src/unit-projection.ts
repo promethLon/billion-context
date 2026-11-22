@@ -13,6 +13,7 @@ import { isSummaryMessageId } from "./prune.js";
 import {
   collectFailedCompressCallIds,
   collectLatestProtected,
+  foldProtectedPayloadKind,
   hasUnrecoverableMediaPayload,
   isMessageLatestProtected,
   isMessageProtected,
@@ -265,13 +266,23 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     }
   }
 
-  const mediaExcluded = directMessageIds.filter((id) => {
+  let structuredExcluded = 0;
+  let mediaExcluded = 0;
+  for (const id of directMessageIds) {
     const msg = msgById(id);
-    return !!msg && hasUnrecoverableMediaPayload(msg);
-  });
-  if (mediaExcluded.length > 0) {
+    if (!msg) continue;
+    const kind = foldProtectedPayloadKind(msg);
+    if (kind === "structured-message") structuredExcluded++;
+    if (kind === "unrecoverable-media") mediaExcluded++;
+  }
+  if (structuredExcluded > 0) {
     warnings.push(
-      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (no stored bytes and no re-access handle in the message) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Ref-based media (remote URL / file id) folds normally since #5620 with its handle recorded in the summary; inline images fold normally too and stay restorable via decompress({ imageRef }).`,
+      `Excluded ${structuredExcluded} structured system/developer message(s) from compression to preserve their original structure and metadata.`,
+    );
+  }
+  if (mediaExcluded > 0) {
+    warnings.push(
+      `Excluded ${mediaExcluded} message(s) carrying unrecoverable media (no stored bytes and no re-access handle in the message) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Ref-based media (remote URL / file id) folds normally since #5620 with its handle recorded in the summary; inline images fold normally too and stay restorable via decompress({ imageRef }).`,
     );
   }
 

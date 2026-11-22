@@ -865,6 +865,70 @@ test("applyCompression excludes refless media from the block and warns", () => {
   );
 });
 
+for (const includeMedia of [false, true]) {
+  test(`compression reports structured Responses messages separately (media: ${includeMedia})`, () => {
+    const structured: CoreMessage = {
+      ...textMsg("developer", "system", "Turn constraints"),
+      rawResponsesItem: {
+        type: "message",
+        role: "developer",
+        id: "dev_1",
+        internal_chat_message_metadata_passthrough: { turn_id: "turn_1" },
+        content: [{ type: "input_text", text: "Turn constraints" }],
+      },
+    };
+    const media = mediaUserMsg("opaque", "See the image", {
+      rawResponsesItem: { type: "input_image" },
+    });
+    const messages = [
+      textMsg("task", "user", "Summarize the previous work"),
+      structured,
+      ...(includeMedia ? [media] : []),
+      textMsg("work", "assistant", "The old work is complete"),
+      textMsg("latest", "user", "Now move on"),
+    ];
+    const state = createInitialState();
+    state.messageRefs = assignRefs(messages, {
+      existing: state.messageRefs,
+      nextIndex: 1,
+    }).map;
+
+    const folded = createCore().applyCompression({
+      ranges: [
+        {
+          startRef: state.messageRefs.byRaw.task!,
+          endRef: state.messageRefs.byRaw.work!,
+          summary: "Previous work is complete.",
+          topic: "work",
+        },
+      ],
+      messages,
+      state,
+      config: config(),
+    });
+
+    assert.deepEqual(folded.result.errors, []);
+    assert.equal(folded.state.blocks.length, 1);
+    const [block] = folded.state.blocks;
+    assert.deepEqual([...block.directMessageIds].sort(), ["task", "work"]);
+    assert.deepEqual([...block.effectiveMessageIds].sort(), ["task", "work"]);
+    const warnings = folded.result.warnings;
+    assert.ok(warnings.includes(
+      "Excluded 1 structured system/developer message(s) from compression to preserve their original structure and metadata.",
+    ));
+    assert.equal(
+      warnings.filter((warning) =>
+        warning.startsWith("Excluded 1 message(s) carrying unrecoverable media")
+      ).length,
+      includeMedia ? 1 : 0,
+    );
+    assert.equal(
+      warnings.filter((warning) => warning.includes("unrecoverable media")).length,
+      includeMedia ? 1 : 0,
+    );
+  });
+}
+
 // --- Anthropic tool_result embedded media (#366) ---
 
 const TR_IMG = {

@@ -618,6 +618,12 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
  *  messageImageBytes) exactly, so "recoverable here" ⇔ "bytes actually
  *  spilled there". */
 export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
+  return foldProtectedPayloadKind(msg) !== undefined;
+}
+
+export function foldProtectedPayloadKind(
+  msg: CoreMessage,
+): "structured-message" | "unrecoverable-media" | undefined {
   const m = msg as CoreMessage & MediaSidecar;
 
   // A verbatim anthropic system message carrying control-plane state (Pi's
@@ -625,7 +631,9 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
   // silently un-declare the tools it adds — never fold. Plain-text ones
   // (Claude Code's environment note) fold like any text message.
   if (m.rawAnthropicMessage != null)
-    return !isPlainTextSystemMessage(m.rawAnthropicMessage);
+    return isPlainTextSystemMessage(m.rawAnthropicMessage)
+      ? undefined
+      : "structured-message";
 
   // #4166 (openai wire, mirror of #3992): a verbatim openai mid-history
   // system message carrying structured parts (DSH tool_addition-style
@@ -634,15 +642,23 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
   // message. isPlainTextSystemMessage is wire-generic: role/content keys +
   // string-or-all-text-parts content.
   if (m.rawOpenaiMessage != null)
-    return !isPlainTextSystemMessage(m.rawOpenaiMessage);
+    return isPlainTextSystemMessage(m.rawOpenaiMessage)
+      ? undefined
+      : "structured-message";
 
   // #4166 (responses wire): same rule for client mid-history
   // system/developer items riding rawResponsesItem. Role-guarded: user
   // cores also carry rawResponsesItem (their byte-fidelity sidecar) and
   // must NOT become unfoldable by this branch.
   if (m.role === "system" && m.rawResponsesItem != null)
-    return !isPlainTextResponsesSystemItem(m.rawResponsesItem);
+    return isPlainTextResponsesSystemItem(m.rawResponsesItem)
+      ? undefined
+      : "structured-message";
 
+  return hasUnrecoverableMediaSidecar(m) ? "unrecoverable-media" : undefined;
+}
+
+function hasUnrecoverableMediaSidecar(m: CoreMessage & MediaSidecar): boolean {
   const roc = m.rawOpenaiContent;
   if (roc != null) {
     const part = asObj(roc);
@@ -651,7 +667,7 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
     // #5620: a remote URL / file ref IS the payload's re-access handle —
     // foldable, the ref rides the stored summary (media-refs.ts). Only
     // byteless-AND-refless opaque parts still pin.
-    if (!isInlineDataUrl(url)) return !hasRefRecoverableMediaPayload(msg);
+    if (!isInlineDataUrl(url)) return !hasRefRecoverableMediaPayload(m);
   }
 
   if (Array.isArray(m.rawOpenaiContentParts)) {
@@ -659,14 +675,14 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
       const part = asObj(p);
       const url =
         part?.type === "image_url" ? asObj(part.image_url)?.url : undefined;
-      if (!isInlineDataUrl(url)) return !hasRefRecoverableMediaPayload(msg);
+      if (!isInlineDataUrl(url)) return !hasRefRecoverableMediaPayload(m);
     }
   }
 
   const ab = asObj(m.rawAnthropicBlock);
   if (ab) {
     if (ab.type === "image" && !anthropicSourceArchivable(asObj(ab.source)))
-      return !hasRefRecoverableMediaPayload(msg);
+      return !hasRefRecoverableMediaPayload(m);
     if (ab.type === "tool_result") {
       const content = ab.content;
       if (Array.isArray(content)) {
@@ -675,7 +691,7 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
           if (!blk || blk.type === "text") continue;
           if (blk.type === "image") {
             if (!anthropicSourceArchivable(asObj(blk.source)))
-              return !hasRefRecoverableMediaPayload(msg);
+              return !hasRefRecoverableMediaPayload(m);
             continue;
           }
           return true;
@@ -705,7 +721,7 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
     }
     for (const p of parts) {
       if (!isInlineDataUrl(asObj(p)?.image_url))
-        return !hasRefRecoverableMediaPayload(msg);
+        return !hasRefRecoverableMediaPayload(m);
     }
   }
 
@@ -717,13 +733,13 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
       const part = asObj(p);
       if (!part) continue;
       if (part.fileData != null || part.videoMetadata != null)
-        return !hasRefRecoverableMediaPayload(msg);
+        return !hasRefRecoverableMediaPayload(m);
       const fr = asObj(part.functionResponse);
       if (fr && Array.isArray(fr.parts)) {
         for (const np of fr.parts) {
           const sub = asObj(np);
           if (sub && (sub.fileData != null || sub.videoMetadata != null))
-            return !hasRefRecoverableMediaPayload(msg);
+            return !hasRefRecoverableMediaPayload(m);
         }
       }
     }
