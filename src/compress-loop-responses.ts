@@ -9,7 +9,9 @@ import { log as loggerLog } from "./logger.js";
 import { drainPendingRetrievals, imageRescaleToolArmed } from "./store.js";
 import { imageRescaleMaxDim } from "./knobs.js";
 import { applyImageRescaleItems } from "./image-rescale.js";
-import { executeProxyToolAsync, buildVisibilityMarker } from "./loop/core.js";
+import { executeProxyToolAsync, buildVisibilityMarker, visibilityMarkerForResult } from "./loop/core.js";
+import type { VisibilityMarkers } from "./config.js";
+import { toolFail, type ProxyToolResult } from "./proxy-tool-result.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
 import { type ResponseInputItem } from "acp-kernel/wire";
@@ -29,9 +31,8 @@ interface CompressLoopResponsesCtx {
     /** Resolved upstream proxy URL (http://host:port) or undefined for direct. */
     proxyUrl?: string;
     textProtocol?: boolean;
-    /** #862: when `false`, suppress 📦/❌ visibility markers (same contract as
-     *  LoopCtx.visibilityMarkers). Default (undefined) keeps markers on. */
-    visibilityMarkers?: boolean;
+    /** Client visibility of proxy tool receipts (same as LoopCtx). */
+    visibilityMarkers?: VisibilityMarkers;
 }
 
 interface RequestOptions {
@@ -103,10 +104,9 @@ function replaceResponsesJsonText(parts: Array<Record<string, unknown>>, text: s
 // instead of silently dropping the trigger. Mutating calls run under
 // withSessionLock, same as the re-request branch below and the streaming loop.
 async function surfaceProxyJson(
-    current: Record<string, unknown>,
     proxyCalls: FunctionCallAccumulator[],
     ctx: CompressLoopResponsesCtx,
-): Promise<Record<string, unknown>> {
+): Promise<string[]> {
     const markers: string[] = [];
     for (const call of proxyCalls) {
         const mutating = MUTATING_PROXY_TOOLS.has(call.name);
@@ -119,19 +119,23 @@ async function surfaceProxyJson(
             rawArgs = call.arguments;
             loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed (len=${call.arguments.length}, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)})`);
         }
-        let result: string;
+        let result: ProxyToolResult;
         try {
-            const toolResult = mutating
+            result = mutating
                 ? await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal))
                 : await executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal);
-            result = toolResult.text;
-            ctx.log(`[acp-proxy: responses JSON ${call.name}${mutating ? "" : " (read-only)"} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
+            ctx.log(`[acp-proxy: responses JSON ${call.name}${mutating ? "" : " (read-only)"} → ${result.text.slice(0, 120).replace(/\n/g, " ")}]`);
         } catch (e) {
-            result = `\u274c [ACP] ${call.name} FAILED: ${String(e)}`;
+            result = toolFail(`\u274c [ACP] ${call.name} FAILED: ${String(e)}`);
             ctx.log(`[acp-proxy: responses JSON ${call.name}${mutating ? "" : " (read-only)"} FAILED: ${String(e)}]`);
         }
-        if (ctx.visibilityMarkers !== false) markers.push(buildVisibilityMarker(call.name, result));
+        const marker = visibilityMarkerForResult(ctx.visibilityMarkers, call.name, result);
+        if (marker !== undefined) markers.push(marker);
     }
+    return markers;
+}
+
+function appendVisibilityMarkers(current: Record<string, unknown>, markers: string[]): Record<string, unknown> {
     if (markers.length === 0) return current;
     const out = Array.isArray(current.output) ? [...(current.output as unknown[])] : [];
     const markerItem = { type: "message", id: `msg_acp_proxy_${Date.now()}_${markers.length}`, role: "assistant", content: [{ type: "output_text", text: markers.join("\n") }] };
@@ -154,6 +158,7 @@ export async function compressLoopResponsesJson(
     requestOptions: RequestOptions,
 ): Promise<Record<string, unknown>> {
     let current = initialResponse;
+    const errorMarkers = new Set<string>();
     for (let loopCount = 1; loopCount <= MAX_LOOP_ROUNDS; loopCount++) {
         current = stripResponsesText(current);
         const output = responsesJsonOutput(current);
@@ -170,9 +175,11 @@ export async function compressLoopResponsesJson(
         if (mutatingProxy.length === 0 || realCalls.length > 0) {
             if (proxyCalls.length > 0) {
                 replaceResponsesJsonText(output.textParts, extracted.clean);
-                current = await surfaceProxyJson(current, proxyCalls, ctx);
+                const markers = await surfaceProxyJson(proxyCalls, ctx);
+                if (ctx.visibilityMarkers !== "errors-only") return appendVisibilityMarkers(current, markers);
+                for (const marker of markers) errorMarkers.add(marker);
             }
-            return current;
+            return appendVisibilityMarkers(current, [...errorMarkers]);
         }
         let inputItems: ResponseInputItem[] = Array.isArray(requestBody.input) ? [...requestBody.input] : [];
         // #3400: the loop re-request resends the client's RAW input items (big
@@ -199,9 +206,14 @@ export async function compressLoopResponsesJson(
                 loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)} (len=${call.arguments.length}, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)})`);
                 rawArgs = call.arguments;
             }
-                const toolResult = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal));
+            const toolResult = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal));
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${toolResult.text.slice(0, 120).replace(/\n/g, " ")}]`);
-            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, toolResult.text) });
+            const marker = visibilityMarkerForResult(ctx.visibilityMarkers, call.name, toolResult);
+            if (ctx.visibilityMarkers === "errors-only" && marker !== undefined) errorMarkers.add(marker);
+            // The continuation still needs the result of successful text triggers.
+            if (ctx.visibilityMarkers !== false) {
+                inputItems.push({ type: "message", role: "user", content: marker ?? buildVisibilityMarker(call.name, toolResult.text) });
+            }
         }
         // #1097: retrieval injections ride the re-request after their ack —
         // as user items (bili's own artifacts take the #377-sanctioned user
@@ -247,5 +259,5 @@ export async function compressLoopResponsesJson(
         }
     }
     ctx.log(`[acp-proxy: responses JSON compress loop limit (${MAX_LOOP_ROUNDS}) reached]`);
-    return current;
+    return appendVisibilityMarkers(current, [...errorMarkers]);
 }

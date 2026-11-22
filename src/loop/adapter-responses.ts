@@ -3,7 +3,6 @@ import { injectResponsesDeveloperMessage, type ResponseInputItem, type Responses
 import { keepResponseId as knobKeepResponseId } from "../knobs.js";
 import { joinResponsesSystemSections } from "../responses-system-sections.js";
 import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "../responses-tool-output.js";
-import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { hashId, strippedResponseIdWarning } from "../util.js";
 import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, ACP_NAME_ALT, type TagEchoFilter } from "./tag-echo-filter.js";
@@ -772,11 +771,11 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             return buf;
         },
 
-        emitMarker(toolName, result) {
+        emitMarker(marker) {
             return buildMessageItemSequence(
                 proxyMessageItemId(outputIndex),
                 outputIndex++,
-                buildVisibilityMarker(toolName, result),
+                marker,
             );
         },
 

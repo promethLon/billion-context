@@ -1,7 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToGoogle } from "acp-kernel/wire";
 import type { GooglePart } from "acp-kernel/wire";
-import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
@@ -734,8 +733,8 @@ export function createGoogleAdapter(
             }]);
         },
 
-        emitMarker(toolName, result) {
-            return buildChunk([{ text: buildVisibilityMarker(toolName, result) }]);
+        emitMarker(marker) {
+            return buildChunk([{ text: marker }]);
         },
 
         emitCompletion(opts?: EmitCompletionOpts) {

@@ -882,9 +882,9 @@ test("plugin-bound proxy compression continues the tool loop instead of ending o
     }
 });
 
-test("a successful compression summary containing FAILED still continues with markers hidden", async () => {
+test("a successful compression summary containing FAILED still continues in errors-only mode", async () => {
     const summary = "summary records an earlier FAILED tool result while this compression itself succeeds";
-    const h = await startHarness([compressToolScript(summary), textScript()], undefined, { visibilityMarkers: false });
+    const h = await startHarness([compressToolScript(summary), textScript()], undefined, { visibilityMarkers: "errors-only" });
     try {
         const { raw } = await callPluginAnthropic(h, "plug-conv-failed-in-summary", sizedPluginHistory(), {
             agent: "hermes",
@@ -895,6 +895,7 @@ test("a successful compression summary containing FAILED still continues with ma
         });
 
         assert.equal(h.captured.length, 2, `a success marker must not be classified by FAILED inside its summary; raw=${raw}`);
+        assert.ok(!raw.includes("[ACP]"), `successful compression remains silent: ${raw}`);
         assert.ok(raw.includes("plain answer"), `expected the continued answer, got: ${raw}`);
     } finally {
         await h.close();

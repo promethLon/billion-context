@@ -4,20 +4,23 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { getSession } from "../src/session.ts";
-import { parseCompressSettings } from "../src/config.ts";
+import { parseCompressSettings, type VisibilityMarkers } from "../src/config.ts";
 import { mergeCompress } from "../src/compress-settings.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { compressLoopResponsesJson } from "../src/compress-loop-responses.ts";
+import { visibilityMarkerForResult } from "../src/loop/core.ts";
+import { compressResult, toolFail, toolOk } from "../src/proxy-tool-result.ts";
 
-test("parseCompressSettings: visibilityMarkers boolean round-trips", () => {
+test("parseCompressSettings: visibilityMarkers modes round-trip", () => {
     const off = parseCompressSettings({ tiers: true, visibilityMarkers: false });
     assert.deepEqual(off, { tiers: true, visibilityMarkers: false });
     const on = parseCompressSettings({ visibilityMarkers: true });
     assert.deepEqual(on, { visibilityMarkers: true });
+    assert.deepEqual(parseCompressSettings({ visibilityMarkers: "errors-only" }), { visibilityMarkers: "errors-only" });
 });
 
-test("parseCompressSettings: non-boolean visibilityMarkers poisons the block", () => {
+test("parseCompressSettings: unknown visibilityMarkers values reject the block", () => {
     assert.equal(parseCompressSettings({ visibilityMarkers: "false" }), undefined);
     assert.equal(parseCompressSettings({ visibilityMarkers: 0 }), undefined);
 });
@@ -27,6 +30,15 @@ test("mergeCompress: visibilityMarkers merges per-level, deepest defined wins", 
     assert.equal(mergeCompress({ visibilityMarkers: true }, { visibilityMarkers: false }).visibilityMarkers, false);
     assert.equal(mergeCompress(undefined, undefined, { visibilityMarkers: false }).visibilityMarkers, false);
     assert.equal(mergeCompress({ tiers: true }).visibilityMarkers, undefined);
+    assert.equal(mergeCompress({ visibilityMarkers: true }, { visibilityMarkers: "errors-only" }).visibilityMarkers, "errors-only");
+    assert.equal(mergeCompress({ visibilityMarkers: "errors-only" }, undefined, { visibilityMarkers: false }).visibilityMarkers, false);
+});
+
+test("errors-only: uses the tool outcome even when receipt text is ambiguous", () => {
+    assert.equal(visibilityMarkerForResult("errors-only", "compress", compressResult("Compressed a range\nSummary quotes FAILED", "applied", 1)), undefined);
+    assert.equal(visibilityMarkerForResult("errors-only", "search_context", toolOk('[No blocks matched "FAILED"]')), undefined);
+    assert.equal(visibilityMarkerForResult("errors-only", "acp_rewrite", toolFail("Invalid summary")), "\n❌ [ACP] Invalid summary\n");
+    assert.equal(visibilityMarkerForResult("errors-only", "compress", compressResult("Compressed a range", "partial", 1)), "\n❌ [ACP] Partial compression: Compressed a range\n");
 });
 
 function makeCtx(): {
@@ -72,20 +84,28 @@ const FC_STATUS = [
 
 const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
 
-async function drainRound(ctx: Parameters<typeof runCompressLoop>[1]): Promise<{ out: string; fetchCalls: number }> {
+const FC_FAILED_SEARCH = [
+    sse("response.output_item.added", { item: { type: "function_call", id: "fc_q", call_id: "call_q", name: "search_context" }, output_index: 1 }),
+    sse("response.function_call_arguments.delta", { item_id: "fc_q", delta: "{}" }),
+    sse("response.output_item.done", { item: { type: "function_call", id: "fc_q", call_id: "call_q", name: "search_context", arguments: "{}" }, output_index: 1 }),
+].join("");
+
+async function drainRound(ctx: Parameters<typeof runCompressLoop>[1], calls = FC_STATUS): Promise<{ out: string; fetchCalls: number; replayed: string }> {
     let n = 0;
     const previousFetch = globalThis.fetch;
-    globalThis.fetch = (async () => {
+    let replayed = "";
+    globalThis.fetch = (async (_url, init) => {
         n++;
+        replayed += String(init?.body);
         return new Response(COMPLETED, { status: 200, headers: { "content-type": "text/event-stream" } });
     }) as typeof fetch;
     try {
         const chunks: Buffer[] = [];
-        const stream = new Response(FC_STATUS + COMPLETED, { status: 200 }).body!;
+        const stream = new Response(calls + COMPLETED, { status: 200 }).body!;
         for await (const chunk of runCompressLoop(stream, ctx, { model: "gpt-4o", input: [], stream: true }, { url: "http://mock", headers: {} }, createResponsesAdapter(), buildCompressSystemPrompt())) {
             chunks.push(chunk);
         }
-        return { out: Buffer.concat(chunks).toString("utf8"), fetchCalls: n };
+        return { out: Buffer.concat(chunks).toString("utf8"), fetchCalls: n, replayed };
     } finally {
         globalThis.fetch = previousFetch;
     }
@@ -117,7 +137,15 @@ test("loop: visibilityMarkers=false suppresses the marker but executes + re-requ
     assert.ok(/event: response\.completed/.test(out), "graceful completion");
 });
 
-function jsonCtx(log: (m: string) => void, visibilityMarkers?: boolean): Parameters<typeof compressLoopResponsesJson>[1] {
+test("streaming errors-only: displays a failure while the successful status result still feeds the model", async () => {
+    const { out, fetchCalls, replayed } = await drainRound({ ...makeCtx(), visibilityMarkers: "errors-only" }, FC_STATUS + FC_FAILED_SEARCH);
+    assert.ok(!out.includes("acp_status result"));
+    assert.match(out, /❌ \[ACP\] search_context FAILED: query is required/);
+    assert.equal(fetchCalls, 1);
+    assert.match(replayed, /"type":"function_call_output","call_id":"call_s"/);
+});
+
+function jsonCtx(log: (m: string) => void, visibilityMarkers?: VisibilityMarkers): Parameters<typeof compressLoopResponsesJson>[1] {
     return {
         core: createCore(),
         config: { modelContextLimit: 200000 } as Config,
@@ -141,6 +169,11 @@ test("json: read-only acp_status marker suppressed when disabled", async () => {
         assert.ok(JSON.stringify(on.output).includes("[ACP]"), "default: read-only marker surfaced");
         const off = await compressLoopResponsesJson(structuredClone(initial), jsonCtx(() => {}, false), { model: "gpt-4o", input: [{ type: "message", role: "user", content: "status" }] }, { url: "https://unused.example/responses", headers: { "content-type": "application/json" } });
         assert.ok(!JSON.stringify(off.output).includes("[ACP]"), "disabled: no read-only marker in output");
+        initial.output.push({ type: "function_call", id: "fc_search", call_id: "call_search", name: "search_context", arguments: "{}" });
+        const errorsOnly = await compressLoopResponsesJson(initial, jsonCtx(() => {}, "errors-only"), { model: "gpt-4o", input: [{ type: "message", role: "user", content: "status and search" }] }, { url: "https://unused.example/responses", headers: { "content-type": "application/json" } });
+        const output = JSON.stringify(errorsOnly.output);
+        assert.ok(!output.includes("acp_status result"));
+        assert.match(output, /❌ \[ACP\] search_context FAILED: query is required/);
     } finally {
         globalThis.fetch = previousFetch;
     }
@@ -167,6 +200,11 @@ test("json: mutating compress re-request body carries the developer marker only 
         await compressLoopResponsesJson(structuredClone(initial), jsonCtx(() => {}, false), structuredClone(request), { url: "https://unused.example/responses", headers: { "content-type": "application/json" } });
         assert.ok(bodies.length === 1, "disabled: re-request still fires");
         assert.ok(!JSON.stringify(bodies[0]).includes("[ACP]"), "disabled: no developer marker in re-request body");
+        bodies.length = 0;
+        const errorsOnly = await compressLoopResponsesJson(structuredClone(initial), jsonCtx(() => {}, "errors-only"), structuredClone(request), { url: "https://unused.example/responses", headers: { "content-type": "application/json" } });
+        assert.equal(bodies.length, 1, "errors-only: re-request still fires");
+        assert.match(JSON.stringify(bodies[0]), /❌ \[ACP\] Compression FAILED/);
+        assert.match(JSON.stringify(errorsOnly.output), /❌ \[ACP\] Compression FAILED/);
     } finally {
         globalThis.fetch = previousFetch;
     }

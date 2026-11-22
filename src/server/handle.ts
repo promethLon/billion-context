@@ -3077,7 +3077,7 @@ async function handleRequest(
                     // requests keep the previous stamp; a model with NO resolvable
                     // price clears it (tokens-only display, never fake dollars).
                     stampBillingPrice(session, requestModel, priceHost);
-                    const visibilityMarkers = cs.visibilityMarkers ?? true;
+                    const visibilityMarkers = cs.visibilityMarkers !== false;
                     const reasoningCfg = cs.reasoning;
                     // #1995/#2607: index recoverable historical images by ref from the RAW
                     // inbound body on every request — archivable media folds by default

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { Config } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
+import type { VisibilityMarkers } from "../src/config.ts";
 import { runCompressLoop, createResponsesAdapter, failedCallSignature, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import type { CoreMessage } from "acp-kernel";
@@ -56,7 +57,7 @@ function makeCtx(messages: CoreMessage[] = []): {
     messages: CoreMessage[];
     session: Session;
     log: (m: string) => void;
-    visibilityMarkers?: boolean;
+    visibilityMarkers?: VisibilityMarkers;
 } {
     return {
         core: createCore(),
@@ -134,7 +135,7 @@ test("#5220 failedCallSignature: key order normalized, unknown names kept, raw f
     assert.equal(failedCallSignature("compress", raw), `compress:${raw}`, "unparseable arguments fall back to byte equality");
 });
 
-test("#5220 T1: first-time failed compress → exactly one recovery-receipt re-request; the model decides (natural end)", async () => {
+async function checkFailedCompressRecovery(visibilityMarkers: true | "errors-only") {
     let n = 0;
     const bodies: string[] = [];
     const orig = globalThis.fetch;
@@ -148,6 +149,7 @@ test("#5220 T1: first-time failed compress → exactly one recovery-receipt re-r
             textMsg("u1", "user", "do the task"),
             textMsg("a1", "assistant", "working on it"),
         ]));
+        ctx.visibilityMarkers = visibilityMarkers;
         // invalid refs → applyRanges returns FAILED, no block created
         const round1 = [
             sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
@@ -171,7 +173,12 @@ test("#5220 T1: first-time failed compress → exactly one recovery-receipt re-r
     } finally {
         globalThis.fetch = orig;
     }
-});
+}
+
+for (const visibilityMarkers of [true, "errors-only"] as const) {
+    test(`#5220 T1 (${visibilityMarkers}): first-time failed compress triggers one recovery-receipt re-request`,
+        () => checkFailedCompressRecovery(visibilityMarkers));
+}
 
 test("#5220 long history: a failed compress reaches the recovery re-request without an argument limit", async () => {
     const messages = Array.from({ length: 250_000 }, (_, i) => textMsg(`m${i}`, i % 2 === 0 ? "user" : "assistant", `history ${i}`));

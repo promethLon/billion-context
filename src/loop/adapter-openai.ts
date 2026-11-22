@@ -1,7 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { isRenderedSummaryMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
-import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
@@ -693,8 +692,8 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             return buildToolCall(call);
         },
 
-        emitMarker(toolName, result) {
-            return buildContent(buildVisibilityMarker(toolName, result));
+        emitMarker(marker) {
+            return buildContent(marker);
         },
 
         emitCompletion(opts?: EmitCompletionOpts) {

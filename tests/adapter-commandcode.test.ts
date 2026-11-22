@@ -130,7 +130,7 @@ test("emit*: every emission is a bare JSONL line of the right event type", () =>
     const tc = parse(adapter.emitToolCall({ name: "bash", callId: "id1", arguments: '{"a":1}' }));
     assert.deepEqual(tc, { type: "tool-call", toolCallId: "id1", toolName: "bash", input: { a: 1 } });
     assert.deepEqual(parse(adapter.emitToolCall({ name: "bash", callId: "id2", arguments: "nope" })).input, {});
-    const marker = parse(adapter.emitMarker("compress", "ok"));
+    const marker = parse(adapter.emitMarker(buildVisibilityMarker("compress", "ok")));
     assert.equal(marker.type, "text-delta");
     assert.equal(marker.text, buildVisibilityMarker("compress", "ok"));
     const fin = parse(adapter.emitCompletion({ finishReason: "length", usage: { inputTokens: 7, outputTokens: 8, cachedTokens: 9 } }));

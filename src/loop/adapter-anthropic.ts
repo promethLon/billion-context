@@ -3,7 +3,6 @@ import { coreToAnthropic, healAnthropicSystemPositions, insertBeforeTrailingSyst
 import { dedupeAdjacentOutputConfig } from "../dedupe-adjacent-output-config.js";
 import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
-import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
@@ -800,8 +799,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             return buildToolUseBlock(clientIndex++, call);
         },
 
-        emitMarker(toolName, result) {
-            return buildTextBlock(clientIndex++, buildVisibilityMarker(toolName, result));
+        emitMarker(marker) {
+            return buildTextBlock(clientIndex++, marker);
         },
 
         emitCompletion(opts?: EmitCompletionOpts) {

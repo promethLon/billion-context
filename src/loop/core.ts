@@ -34,6 +34,7 @@ import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeAcpRetire, executeAcpRestore, executeAcpRewrite, effectiveBlockOpsConfig } from "../acp-block-ops.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { toolFail, toolOk, type ProxyToolResult } from "../proxy-tool-result.js";
+import type { VisibilityMarkers } from "../config.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, throttle429ModelScope } from "../upstream-throttle.js";
 import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
@@ -77,9 +78,9 @@ export function failedCallSignature(name: string, argsJson: string): string {
     return `${name}:${norm}`;
 }
 
-export function buildVisibilityMarker(toolName: string, result: string): string {
+export function buildVisibilityMarker(toolName: string, result: string, errorOutcome?: "failure" | "refused" | "partial"): string {
     const lines = result.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-    const failed = lines.some((l) =>
+    const failed = errorOutcome !== undefined || lines.some((l) =>
         l.includes("FAILED")
         || l.includes("not found")
         || l.includes("is required")
@@ -104,7 +105,17 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
     }
 
     const inner = (lines[0] ?? "").replace(/^\[/, "").replace(/\]$/, "").trim();
-    return `\n${icon} [ACP] ${inner}\n`;
+    const prefix = errorOutcome === "partial" ? "Partial compression: " : "";
+    return `\n${icon} [ACP] ${prefix}${inner}\n`;
+}
+
+export function visibilityMarkerForResult(mode: VisibilityMarkers | undefined, toolName: string, result: ProxyToolResult): string | undefined {
+    if (mode === false) return;
+    if (mode !== "errors-only") return buildVisibilityMarker(toolName, result.text);
+    const { outcome } = result;
+    if (outcome === "failure" || outcome === "refused" || outcome === "partial") {
+        return buildVisibilityMarker(toolName, result.text, outcome);
+    }
 }
 
 // #3302 (Ask 6): accumulate endpoint values from failed compress receipts and
@@ -268,12 +279,8 @@ export interface LoopCtx {
     // compute the true context total correctly (Anthropic reports
     // input_tokens as NEW-only; OpenAI/Responses report the TOTAL).
     protocol?: WireProtocol;
-    /** #862: when `false`, suppress the 📦/❌ ACP visibility markers emitted
-     *  after proxy tool executions — both the marker line streamed to the
-     *  client (`emitMarker`) and the orphan marker message re-injected into
-     *  rebuilt history. Default (undefined) keeps markers on. Paired
-     *  tool-call/tool-result messages are unaffected. */
-    visibilityMarkers?: boolean;
+    /** Client visibility of proxy tool receipts. Tool results still feed the model. */
+    visibilityMarkers?: VisibilityMarkers;
     /** #1455: tee loop-originated upstream responses (re-request and every
      *  retry fetch) to raw SSE files — the outer request's ACP_DUMP_SSE tee
      *  only covers the FIRST response, so an internal re-request that dies
@@ -423,7 +430,7 @@ export interface CompressLoopAdapter {
     emitText(delta: string): Buffer;
     emitReasoning?(delta: string): Buffer;
     emitToolCall(call: ToolCallEmit): Buffer;
-    emitMarker(toolName: string, result: string): Buffer;
+    emitMarker(marker: string): Buffer;
     emitCompletion(opts?: EmitCompletionOpts): Buffer;
     emitError(message: string): Buffer;
     extractTextTriggers?(text: string): ExtractedTextTriggers;
@@ -1419,7 +1426,7 @@ export async function* runCompressLoop(
 
             let realCalls = 0;
             const realToolCalls: ToolCallEmit[] = [];
-            const proxyResults: { name: string; callId: string; result: string; arguments: string; wireArguments: string; signature?: string; image?: { base64: string; mediaType: string } }[] = [];
+            const proxyResults: { name: string; callId: string; result: string; arguments: string; wireArguments: string; signature?: string; marker?: string; image?: { base64: string; mediaType: string } }[] = [];
             // #5220: the marker lines ACTUALLY streamed to the client this round
             // (deduped, same order as the stream). On a failed-only round this IS
             // the recovery receipt the retry body must carry — reconstructing it
@@ -1450,15 +1457,16 @@ export async function* runCompressLoop(
                         parsedArgs = {};
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, parsedArgs, ctx, call.callId, rawArgs, signal));
-                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, wireArguments: rawArgs === undefined ? call.arguments : MALFORMED_PROXY_TOOL_ARGS_REPLAY, signature: call.signature, ...(result.image ? { image: result.image } : {}) });
-                    if (ctx.visibilityMarkers !== false) {
+                    const marker = visibilityMarkerForResult(ctx.visibilityMarkers, call.name, result);
+                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, wireArguments: rawArgs === undefined ? call.arguments : MALFORMED_PROXY_TOOL_ARGS_REPLAY, signature: call.signature, marker, ...(result.image ? { image: result.image } : {}) });
+                    if (marker !== undefined) {
                         const markerKey = `${call.name}\u0000${result.text}`;
                         if (seenMarkers.has(markerKey)) {
                             ctx.log(`[acp-loop] suppressed duplicate ${call.name} status marker (identical failure repeated this request)`);
                         } else {
                             seenMarkers.add(markerKey);
-                            yield adapter.emitMarker(call.name, result.text);
-                            streamedMarkers.push(buildVisibilityMarker(call.name, result.text));
+                            yield adapter.emitMarker(marker);
+                            streamedMarkers.push(marker);
                         }
                     }
                 } else {
@@ -1620,7 +1628,8 @@ export async function* runCompressLoop(
                             id: `acp_loop_r${round}_marker_${pr.callId}`,
                             role: "system",
                             contentType: "text",
-                            text: buildVisibilityMarker(pr.name, pr.result),
+                            // Text-triggered calls have no native tool-result frame.
+                            text: pr.marker ?? buildVisibilityMarker(pr.name, pr.result),
                         });
                         // #2701: visibility markers are CLIENT-side noise; they
                         // are streamed to the client (emitMarker) and deliberately

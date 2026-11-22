@@ -5,7 +5,6 @@
 // there is no [DONE] sentinel (WC-1).
 
 import { createOpenaiAdapter } from "./adapter-openai.js";
-import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
@@ -245,10 +244,10 @@ export function createCommandcodeAdapter(
             return lineBuf(JSON.stringify({ type: "tool-call", toolCallId: call.callId, toolName: call.name, input }));
         },
 
-        emitMarker(toolName, result) {
+        emitMarker(marker) {
             // The base openai marker is SSE-framed; on this wire the marker
             // rides as prose inside a text-delta (WC-5).
-            return lineBuf(JSON.stringify({ type: "text-delta", text: buildVisibilityMarker(toolName, result) }));
+            return lineBuf(JSON.stringify({ type: "text-delta", text: marker }));
         },
 
         emitCompletion(opts?: EmitCompletionOpts): Buffer {

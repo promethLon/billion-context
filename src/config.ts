@@ -203,6 +203,8 @@ export type ModelEntry = {
     cacheKeepalive?: CacheKeepaliveSettings;
 };
 
+export type VisibilityMarkers = boolean | "errors-only";
+
 /** User-facing compression tuning. Configurable at three levels — global
  *  (config root `compress`), per-provider (`providers[url].compress`), per-model
  *  (`providers[url].models[model].compress`) — merged deepest-field-wins by
@@ -455,12 +457,9 @@ export type CompressSettings = {
      *  Patterns match like kernel tool patterns (exact name or `*` glob).
      *  Deepest level wins (global → provider → model), whole-array replace. */
     preserveRecentTools?: string[];
-    /** Emit 📦/❌ ACP visibility markers after proxy tool executions
-     *  (compress / decompress / search_context / acp_status) — both the marker
-     *  line streamed to the client and the marker message re-injected into
-     *  rebuilt history. `false` suppresses them entirely, for deployments where
-     *  models imitate or narrate around the markers (#862). Default `true`. */
-    visibilityMarkers?: boolean;
+    /** Show all ACP proxy tool receipts (default), only failures and partial
+     *  results ("errors-only"), or hide receipts entirely (false). */
+    visibilityMarkers?: VisibilityMarkers;
     /** #4313 (PR #5236; default-on follow-up): stamp each message with its
      *  immutable local time-of-occurrence and render it in the <acp> tag
      *  (`time="..."`) — DEFAULT ON since the leak-audit follow-up: stamps are
@@ -3382,7 +3381,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         else out.preserveRecentTools = (v as string[]).map((x) => x.trim());
     }
     if ("visibilityMarkers" in obj) {
-        if (typeof obj.visibilityMarkers !== "boolean") ok = false;
+        if (typeof obj.visibilityMarkers !== "boolean" && obj.visibilityMarkers !== "errors-only") ok = false;
         else out.visibilityMarkers = obj.visibilityMarkers;
     }
     if ("messageTimestamps" in obj) {

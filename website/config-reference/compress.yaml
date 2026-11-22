@@ -292,16 +292,16 @@ entries:
     site_en: "Subtraction form: recent-zone tools minus this list get full protection. An empty array here is rejected as a typo."
     site_zh: "减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。"
   - key: compress.visibilityMarkers
-    type: boolean
+    type: 'boolean | "errors-only"'
     default: "true"
     group: compress
     id: ct.vm
     render: compress-row
-    desc_en: "Append visibility markers after compress/decompress/search_context/acp_status results; off stops imitated narration."
-    desc_zh: "在 compress/decompress/search_context/acp_status 结果后追加可见性标记；关闭可抑制模型模仿叙述。"
-    desc_ja: "`compress`/`decompress`/`search_context`/`acp_status` の結果後に可視性マーカーを追加。オフにすると模倣ナレーションが停止する。"
-    site_en: "Append 📦/❌ visibility markers after compress/decompress/search_context/acp_status results (on by default; off stops imitated narration)."
-    site_zh: "在 compress/decompress/search_context/acp_status 结果后追加 📦/❌ 可见性标记（默认开；关闭可抑制模型模仿叙述）。"
+    desc_en: 'Show all proxy tool receipts, only failures and partial results, or no receipts.'
+    desc_zh: '显示全部代理工具回执、仅显示失败和部分成功的回执，或隐藏全部回执。'
+    desc_ja: 'プロキシツールの受領証をすべて表示、失敗と部分成功のみ表示、またはすべて非表示にする。'
+    site_en: 'Proxy tool receipts: true shows all, "errors-only" shows failures and partial results, false hides all.'
+    site_zh: '代理工具回执：true 显示全部，"errors-only" 显示失败和部分成功，false 隐藏全部。'
   - key: compress.messageTimestamps
     type: boolean
     default: "true"
