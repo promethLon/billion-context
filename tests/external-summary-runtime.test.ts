@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createCore, defaultConfig, defaultPrompts, type Config, type CoreMessage } from "acp-kernel";
+import { createCore, defaultConfig, defaultPrompts, resolveBlockSpan, type Config, type CoreMessage } from "acp-kernel";
 import { applyConfiguredCompression } from "../src/external-summary-compress.ts";
 import { SummaryCredentialStore } from "../src/external-summary-credentials.ts";
 import { executeProxyToolAsync } from "../src/loop/core.ts";
@@ -397,7 +397,15 @@ test("external refolds index selected block ids once while preserving reference 
         const initial = ctx.session.state;
         const selectedIds = new Set(initial.blocks.slice(0, selected).map((block) => block.blockId));
         const expected = initial.blocks.filter((block) => block.active && !selectedIds.has(block.blockId))
-            .map(({ topic, summary }) => ({ topic, summary }));
+            .map((block) => {
+                const span = resolveBlockSpan(block, initial.messageRefs.byRaw);
+                return {
+                    blockId: block.blockId,
+                    ...(span ? { range: `${span.startRef}-${span.endRef}` } : {}),
+                    topic: block.topic,
+                    summary: block.summary,
+                };
+            });
         const applyCompression = ctx.core.applyCompression.bind(ctx.core);
         let preview = true;
         ctx.core = { ...ctx.core, applyCompression(input) {
@@ -421,7 +429,10 @@ test("external refolds index selected block ids once while preserving reference 
 
         assert.equal(result.outcome, "applied", result.text);
         assert.deepEqual(sentReference?.otherSummaries, expected);
-        assert.deepEqual(sentReference?.currentContext, ctx.messages.slice(-5).map(({ role, text }) => ({ role, text })));
+        assert.deepEqual(sentReference?.currentContext, ctx.messages.slice(-5).map((message) => {
+            const ref = initial.messageRefs.byRaw[message.id];
+            return ref ? { ref, role: message.role, text: message.text } : { role: message.role, text: message.text };
+        }));
         assert.equal(sentReference?.submittedSummaryHint, "Retain the selected historical work.");
         t.diagnostic(`${blockIdReads} selected-block-id visits for ${count} source blocks`);
         assert.ok(blockIdReads <= count * 8, `selected block ids were visited ${blockIdReads} times for ${count} source blocks`);

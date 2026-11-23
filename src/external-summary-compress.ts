@@ -1,4 +1,4 @@
-import { collectBlockContent } from "acp-kernel";
+import { BLOCKED_REF, collectBlockContent, resolveBlockSpan } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from "./compress-tool.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
@@ -6,7 +6,16 @@ import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, supersededRefRejection, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
-import { describeExternalSummaryFailure, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
+import {
+    buildCitationMessageIndex,
+    collectGroundedMessageRefs,
+    describeExternalSummaryFailure,
+    highestAllocatedMessageRef,
+    neutralizeUngroundedMessageRefs,
+    summaryLengthBudgetClause,
+    verifyMessageRefCitations,
+    type SummaryWork,
+} from "./external-summary.js";
 import { newExternalCallId } from "./external-summary-marker.js";
 
 // Re-exported for callers that historically imported it here; the canonical
@@ -64,6 +73,9 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     });
     const work: SummaryWork[] = [];
     const valid: ParsedRange[] = [];
+    const groundedByRange: Array<Set<number>> = [];
+    const messageFacts = buildCitationMessageIndex(messages, state.messageRefs.byRaw, ctx.session.contentStore);
+    const maxAllocatedRef = highestAllocatedMessageRef(state.messageRefs.byRef, messageFacts);
     let hasProbeChanges = false;
     // Kernel protection and aggregate size checks must see the complete batch.
     const probes = resolved.translatedRanges.map((range, index) => {
@@ -90,20 +102,47 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
         if (!content.trim()) continue;
         const covered = new Set(blocks.flatMap((block) => block.effectiveMessageIds));
         const directBlockIds = new Set(blocks.flatMap((block) => block.directBlockIds));
+        const currentContext = messages
+            .filter((message, index) => !covered.has(message.id)
+                && (message.role === "user" || index >= messages.length - 5))
+            .map((message) => {
+                const ref = state.messageRefs.byRaw[message.id];
+                return ref && ref !== BLOCKED_REF
+                    ? { ref, role: message.role, text: message.text }
+                    : { role: message.role, text: message.text };
+            });
+        const otherSummaries = state.blocks
+            .filter((candidate) => candidate.active && !directBlockIds.has(candidate.blockId))
+            .map((candidate) => {
+                const span = resolveBlockSpan(candidate, state.messageRefs.byRaw);
+                const verifiedSummary = verifyMessageRefCitations(candidate.summary, messageFacts, maxAllocatedRef).summary;
+                return {
+                    blockId: candidate.blockId,
+                    ...(span ? { range: `${span.startRef}-${span.endRef}` } : {}),
+                    topic: candidate.topic,
+                    summary: verifiedSummary,
+                };
+            });
         const reference = JSON.stringify({
             submittedSummaryHint: range.summary,
-            currentContext: messages.filter((message, index) => !covered.has(message.id)
-                && (message.role === "user" || index >= messages.length - 5)).map(({ role, text }) => ({ role, text })),
-            otherSummaries: state.blocks.filter((candidate) => candidate.active && !directBlockIds.has(candidate.blockId))
-                .map(({ topic, summary }) => ({ topic, summary })),
+            currentContext,
+            otherSummaries,
         });
         valid.push(range);
+        groundedByRange.push(collectGroundedMessageRefs([
+            content,
+            range.startRef,
+            range.endRef,
+            ...Array.from(covered, (id) => state.messageRefs.byRaw[id]),
+            ...currentContext.flatMap((entry) => ["ref" in entry ? entry.ref : undefined, entry.text]),
+            ...otherSummaries.flatMap((entry) => ["range" in entry ? entry.range : undefined, entry.topic, entry.summary]),
+        ]));
         // #3635: state the EXACT cap the validator enforces in the instructions
         // — the preflight path has told its summarizers this number since #1775;
         // without it the compress path asked for output it could never accept.
         const maxSummaryChars = Math.min(range.summaryMaxChars ?? Infinity, ctx.config.compress.maxSummaryLength);
         work.push({ content, reference, minSummaryChars: ctx.config.compress.minSummaryLength, maxSummaryChars,
-            instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt(undefined, messageTimestampSections(undefined))}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.`
+            instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt(undefined, messageTimestampSections(undefined))}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Only cite message refs (mNNNNN) that appear verbatim in content or reference; never guess, approximate, or invent a message ref. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.`
                 + summaryLengthBudgetClause(maxSummaryChars, ctx.config.compress.minSummaryLength) });
     }
     if (work.length === 0) {
@@ -118,7 +157,18 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     if (signal?.aborted || ctx.session.state !== state || ctx.session.revisionEpoch !== revision) return compressResult("[Compression FAILED: cancelled or session changed while generating external summaries. Nothing compressed.]", "refused", 0);
     const successful: ParsedRange[] = [];
     for (const [index, result] of batch.results.entries()) {
-        if (result.status === "success") successful.push({ ...valid[index], summary: result.summary, compressCallId: newExternalCallId() });
+        if (result.status !== "success") continue;
+        const target = valid[index];
+        const maxSummaryChars = work[index].maxSummaryChars;
+        const checked = neutralizeUngroundedMessageRefs(result.summary, groundedByRange[index], {
+            messageFacts,
+            maxAllocatedRef,
+            maxChars: maxSummaryChars !== undefined && Number.isFinite(maxSummaryChars) && maxSummaryChars > 0 ? maxSummaryChars : undefined,
+        });
+        if (checked.neutralized.length > 0) {
+            ctx.log(`[external-summary] neutralized ${checked.neutralized.length} unverified message ref(s) in ${target.startRef}-${target.endRef}: ${checked.neutralized.join(", ")}`);
+        }
+        successful.push({ ...target, summary: checked.summary, compressCallId: newExternalCallId() });
     }
     // #3635: full failure description (parity with the preflight log line) so
     // an over-cap rejection is visible with its length reason, not bare "batch=finished".

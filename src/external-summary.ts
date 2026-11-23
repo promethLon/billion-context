@@ -1,3 +1,5 @@
+import type { CoreMessage, MessageContentStore, MessageRefMap } from "acp-kernel";
+
 export interface SummaryWork {
     readonly content: string;
     readonly instructions: string;
@@ -108,6 +110,379 @@ function invalidSummaryDetail(value: unknown, limits: SummaryBudget, request: Re
 export function summaryLengthBudgetClause(budget: number | undefined, minChars: number): string {
     if (budget === undefined || !Number.isFinite(budget) || budget <= 0 || budget < minChars) return "";
     return `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${budget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`;
+}
+
+/** Canonical message-ref citations (`m00001`–`m99999`, `m100000+`, or zero-padded
+ *  4-digit drift like `m0538`), bounded away from ASCII identifier chars so CJK
+ *  and English prose (`见m01538附`, `(m01538)`, `m01636–m01672`) match while
+ *  identifiers (`foo_m01538`, `m01538a`) and 4-digit non-zero-padded tokens
+ *  (`m2026`, `m1024`) stay untouched. */
+const MESSAGE_REF_CITATION_RE = /(?<![A-Za-z0-9_])m(0\d{3,6}|[1-9]\d{4,6})(?![A-Za-z0-9_])/g;
+const SINGLE_MESSAGE_REF_RE = /^m(0\d{3,6}|[1-9]\d{4,6})$/;
+
+/** Citation group linking adjacent refs such as `m00005/m00009` or
+ *  `m01636–m01672` so paired citations (e.g. user approval + assistant plan)
+ *  are evaluated together instead of falsely rejecting the partner ref. */
+const MESSAGE_REF_GROUP_RE = /(?<![A-Za-z0-9_])m(?:0\d{3,6}|[1-9]\d{4,6})(?:\s*(?:\/|、|,|–|—|-|~|\.\.)\s*m(?:0\d{3,6}|[1-9]\d{4,6}))*(?![A-Za-z0-9_])/g;
+
+const QUOTE_SPANS_RE = /「([^「」\n]{1,400})」|『([^『』\n]{1,400})』|“([^“”\n]{1,400})”|"([^"\n]{1,400})"/g;
+const CODE_SPAN_RE = /```[\s\S]*?```|`[^`\n]+`/g;
+const CLAUSE_BREAK_RE = /[\n。；;!?！？→⇒]|->|=>/;
+const NORMALIZE_QUOTE_RE = /[\s\u3000,.;:!?，。；：！？、"'「」『』“”‘’()（）[\]【】—–\-`/*+＋]+/g;
+const CJK_CHAR_RE = /[\u3400-\u9fff\uf900-\ufaff]/g;
+const ELLIPSIS_SPLIT_RE = /\.{3,}|…+/;
+const QUOTE_TRIGRAM_MIN_OVERLAP = 0.45;
+
+const CHRONOLOGICAL_AFTER_RE = /^\s*(?:之后|以后|之前|以前|after\b|before\b)/i;
+const CHRONOLOGICAL_BEFORE_RE = /(?:之后|以后|之前|以前|\bafter|\bbefore)\s*$/i;
+
+const DIRECT_USER_BEFORE_ZH_RE = /(?:^|[^\u4e00-\u9fffA-Za-z0-9_])用户(?:此前|先前|已经?|明确|直接|正式|原话)?(?:授权|批准|同意|确认|要求|指示|指令|原话|发言|提问|回复|说|表示)\s*(?:[（([\s：:]*)?(?:原文见|原文|详见|参见|见|于|在)?\s*$/;
+const DIRECT_USER_BEFORE_EN_RE = /\buser(?:'s)?\s+(?:previously\s+|explicitly\s+)?(?:said|asked|requested|authorized|authorised|approved|confirmed|instructed|replied|stated|message|prompt|authorization|authorisation|approval|quote)\s*(?:[（([\s：:]*)?(?:in|at|see|from|ref)?\s*$/i;
+const USER_SUBJECT_BEFORE_ZH_RE = /(?:^|[^\u4e00-\u9fffA-Za-z0-9_])用户(?:此前|先前|先)?(?:在|于)?\s*$/;
+const USER_ACTION_AFTER_ZH_RE = /^\s*(?:[（(]?[^）)\n]{0,6}[）)]?)?\s*(?:明确|直接|正式|已)?(?:授权|批准|同意|确认|要求|指示|指令|原话|说|表示)/;
+const DIRECT_USER_AFTER_ZH_RE = /^\s*(?:[，,、]\s*)?用户(?:此前|先前|已经?|明确|直接|正式)?(?:授权|批准|同意|确认|要求|指示|指令|原话|说|表示)/;
+const DIRECT_USER_AFTER_EN_RE = /^\s*(?:,\s*)?user(?:'s)?\s+(?:previously\s+|explicitly\s+)?(?:said|asked|requested|authorized|authorised|approved|confirmed|instructed|authorization|authorisation|approval)\b/i;
+
+const MAX_QUOTE_AFTER_GAP = 20;
+const MAX_QUOTE_BEFORE_GAP = 14;
+const MAX_RANGE_EXPANSION = 50;
+
+export const UNVERIFIED_REF_PLACEHOLDER = "[unverified-ref]";
+const COMPACT_UNVERIFIED_REF_PLACEHOLDER = "[ref?]";
+const SHORT_UNVERIFIED_REF_PLACEHOLDER = "[?]";
+
+interface CitationMessageFact {
+    readonly role?: string;
+    readonly text?: string;
+    normalizedText?: string;
+}
+
+/** Collect every numeric message-ref index appearing verbatim in authoritative
+ *  summarizer inputs (selected content, covered message refs, reference context,
+ *  sibling summaries). Excludes prompt examples and non-authoritative hints. */
+export function collectGroundedMessageRefs(sources: readonly (string | undefined)[]): Set<number> {
+    const refs = new Set<number>();
+    for (const source of sources) {
+        if (!source) continue;
+        MESSAGE_REF_CITATION_RE.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = MESSAGE_REF_CITATION_RE.exec(source)) !== null) {
+            refs.add(Number(match[1]));
+        }
+    }
+    return refs;
+}
+
+/** Build an in-memory map from numeric message ref index to known original
+ *  `role` and `text` using the current session messages and (when already loaded)
+ *  the append-only content store. Pure in-memory lookup; never triggers disk I/O. */
+export function buildCitationMessageIndex(
+    messages: readonly CoreMessage[],
+    byRaw: MessageRefMap["byRaw"],
+    contentStore?: MessageContentStore,
+): Map<number, CitationMessageFact> {
+    const facts = new Map<number, CitationMessageFact>();
+    for (const message of messages) {
+        const ref = byRaw[message.id];
+        if (!ref) continue;
+        const m = SINGLE_MESSAGE_REF_RE.exec(ref);
+        if (!m) continue;
+        facts.set(Number(m[1]), { role: message.role, text: message.text ?? "" });
+    }
+    if (contentStore) {
+        for (const [ref, entry] of Object.entries(contentStore.byRef)) {
+            const m = SINGLE_MESSAGE_REF_RE.exec(ref);
+            if (!m) continue;
+            const index = Number(m[1]);
+            if (facts.has(index)) continue;
+            const text = contentStore.byHash[entry.hash];
+            const role = entry.toolName !== undefined || entry.command !== undefined ? "tool" : undefined;
+            if (text !== undefined || role !== undefined) {
+                facts.set(index, { role, text });
+            }
+        }
+    }
+    return facts;
+}
+
+/** Highest numeric ref index allocated in a session ref map + known message facts. */
+export function highestAllocatedMessageRef(
+    byRef: MessageRefMap["byRef"],
+    messageFacts?: ReadonlyMap<number, CitationMessageFact>,
+): number {
+    let highest = 0;
+    for (const ref of Object.keys(byRef)) {
+        const m = SINGLE_MESSAGE_REF_RE.exec(ref);
+        if (m) highest = Math.max(highest, Number(m[1]));
+    }
+    if (messageFacts) {
+        for (const index of messageFacts.keys()) {
+            if (index > highest) highest = index;
+        }
+    }
+    return highest;
+}
+
+function normalizeForQuoteMatch(text: string): string {
+    return text.toLowerCase().replace(NORMALIZE_QUOTE_RE, "");
+}
+
+function normalizedFactText(fact: CitationMessageFact): string | undefined {
+    if (typeof fact.text !== "string" || fact.text.length === 0) return undefined;
+    if (fact.normalizedText === undefined) {
+        fact.normalizedText = normalizeForQuoteMatch(fact.text);
+    }
+    return fact.normalizedText;
+}
+
+function extractVerifiableQuoteSegments(rawQuote: string): string[] | null {
+    const segments = rawQuote
+        .split(ELLIPSIS_SPLIT_RE)
+        .map((part) => normalizeForQuoteMatch(part))
+        .filter((part) => part.length >= 4);
+    if (segments.length === 0) return null;
+    const combined = segments.join("");
+    const cjkCount = (combined.match(CJK_CHAR_RE) ?? []).length;
+    if (cjkCount >= 6 || combined.length >= 12) return segments;
+    return null;
+}
+
+function clauseBefore(text: string, pos: number, window: number): string {
+    const slice = text.slice(Math.max(0, pos - window), pos);
+    const re = new RegExp(CLAUSE_BREAK_RE.source, "g");
+    let lastEnd = -1;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(slice)) !== null) lastEnd = m.index + m[0].length;
+    return lastEnd >= 0 ? slice.slice(lastEnd) : slice;
+}
+
+function clauseAfter(text: string, pos: number, window: number): string {
+    const slice = text.slice(pos, Math.min(text.length, pos + window));
+    const breakIdx = slice.search(CLAUSE_BREAK_RE);
+    return breakIdx >= 0 ? slice.slice(0, breakIdx) : slice;
+}
+
+function quoteSupportedByText(segments: readonly string[], normalizedOriginal: string): boolean {
+    if (segments.every((seg) => normalizedOriginal.includes(seg))) return true;
+    let totalGrams = 0;
+    let hitGrams = 0;
+    for (const seg of segments) {
+        if (seg.length < 3) continue;
+        for (let i = 0; i <= seg.length - 3; i++) {
+            totalGrams += 1;
+            if (normalizedOriginal.includes(seg.slice(i, i + 3))) hitGrams += 1;
+        }
+    }
+    return totalGrams > 0 && hitGrams / totalGrams >= QUOTE_TRIGRAM_MIN_OVERLAP;
+}
+
+function expandGroupIndices(groupText: string): number[] {
+    const indices: number[] = [];
+    const rangeMatch = /^m(0\d{3,6}|[1-9]\d{4,6})\s*(?:–|—|-|~|\.\.)\s*m(0\d{3,6}|[1-9]\d{4,6})$/.exec(groupText);
+    if (rangeMatch) {
+        const lo = Math.min(Number(rangeMatch[1]), Number(rangeMatch[2]));
+        const hi = Math.max(Number(rangeMatch[1]), Number(rangeMatch[2]));
+        if (hi - lo <= MAX_RANGE_EXPANSION) {
+            for (let n = lo; n <= hi; n++) indices.push(n);
+            return indices;
+        }
+        return [lo, hi];
+    }
+    MESSAGE_REF_CITATION_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = MESSAGE_REF_CITATION_RE.exec(groupText)) !== null) {
+        indices.push(Number(m[1]));
+    }
+    return indices;
+}
+
+function hasDirectUserAttribution(summary: string, gStart: number, gEnd: number): boolean {
+    const before = clauseBefore(summary, gStart, 32);
+    const after = clauseAfter(summary, gEnd, 28);
+    if (DIRECT_USER_BEFORE_ZH_RE.test(before) || DIRECT_USER_BEFORE_EN_RE.test(before)) return true;
+    if (USER_SUBJECT_BEFORE_ZH_RE.test(before) && USER_ACTION_AFTER_ZH_RE.test(after)) return true;
+    if (DIRECT_USER_AFTER_ZH_RE.test(after) || DIRECT_USER_AFTER_EN_RE.test(after)) return true;
+    return false;
+}
+
+interface QuoteSpan {
+    readonly start: number;
+    readonly end: number;
+    readonly segments: readonly string[];
+}
+
+function collectQuoteSpans(summary: string): QuoteSpan[] {
+    const codeRanges: Array<{ start: number; end: number }> = [];
+    CODE_SPAN_RE.lastIndex = 0;
+    let cm: RegExpExecArray | null;
+    while ((cm = CODE_SPAN_RE.exec(summary)) !== null) {
+        codeRanges.push({ start: cm.index, end: cm.index + cm[0].length });
+    }
+    const insideCode = (pos: number): boolean => codeRanges.some((r) => pos >= r.start && pos < r.end);
+    const spans: QuoteSpan[] = [];
+    QUOTE_SPANS_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = QUOTE_SPANS_RE.exec(summary)) !== null) {
+        if (insideCode(m.index)) continue;
+        const inner = m[1] ?? m[2] ?? m[3] ?? m[4] ?? "";
+        const segments = extractVerifiableQuoteSegments(inner);
+        if (segments) spans.push({ start: m.index, end: m.index + m[0].length, segments });
+    }
+    return spans;
+}
+
+function findAdjacentQuote(summary: string, gStart: number, gEnd: number, quotes: readonly QuoteSpan[]): QuoteSpan | undefined {
+    let best: QuoteSpan | undefined;
+    let bestDist = Infinity;
+    for (const q of quotes) {
+        if (q.start >= gEnd) {
+            const gap = q.start - gEnd;
+            if (gap <= MAX_QUOTE_AFTER_GAP && !CLAUSE_BREAK_RE.test(summary.slice(gEnd, q.start)) && gap < bestDist) {
+                best = q;
+                bestDist = gap;
+            }
+        } else if (gStart >= q.end) {
+            const gap = gStart - q.end;
+            if (gap <= MAX_QUOTE_BEFORE_GAP && !CLAUSE_BREAK_RE.test(summary.slice(q.end, gStart)) && gap < bestDist) {
+                best = q;
+                bestDist = gap;
+            }
+        }
+    }
+    return best;
+}
+
+interface NeutralizeCitationsOptions {
+    readonly maxChars?: number;
+    readonly messageFacts?: ReadonlyMap<number, CitationMessageFact>;
+    readonly maxAllocatedRef?: number;
+}
+
+interface NeutralizeCitationsResult {
+    readonly summary: string;
+    readonly neutralized: readonly string[];
+}
+
+function findInvalidRefSpans(
+    summary: string,
+    groundedRefs: ReadonlySet<number> | null,
+    options: NeutralizeCitationsOptions,
+): Array<{ start: number; end: number; raw: string }> {
+    const invalid: Array<{ start: number; end: number; raw: string }> = [];
+    const facts = options.messageFacts;
+    const maxAllocated = options.maxAllocatedRef;
+    const quotes = facts && facts.size > 0 ? collectQuoteSpans(summary) : [];
+
+    MESSAGE_REF_GROUP_RE.lastIndex = 0;
+    let groupMatch: RegExpExecArray | null;
+    while ((groupMatch = MESSAGE_REF_GROUP_RE.exec(summary)) !== null) {
+        const groupText = groupMatch[0];
+        const gStart = groupMatch.index;
+        const gEnd = gStart + groupText.length;
+        const beforeShort = clauseBefore(summary, gStart, 16);
+        const afterShort = clauseAfter(summary, gEnd, 16);
+        const isChronological = CHRONOLOGICAL_AFTER_RE.test(afterShort) || CHRONOLOGICAL_BEFORE_RE.test(beforeShort);
+
+        const groupIndices = expandGroupIndices(groupText);
+        let groupFactViolation = false;
+        if (facts && facts.size > 0 && !isChronological && groupIndices.length > 0) {
+            const resolvedFacts = groupIndices.map((n) => facts.get(n));
+            const allHaveFacts = resolvedFacts.every((f): f is CitationMessageFact => f !== undefined);
+
+            if (allHaveFacts && hasDirectUserAttribution(summary, gStart, gEnd)) {
+                const allHaveRoles = resolvedFacts.every((f) => typeof f.role === "string" && f.role.length > 0);
+                if (allHaveRoles && !resolvedFacts.some((f) => f.role === "user")) {
+                    groupFactViolation = true;
+                }
+            }
+
+            if (!groupFactViolation && allHaveFacts && quotes.length > 0) {
+                const adjacentQuote = findAdjacentQuote(summary, gStart, gEnd, quotes);
+                if (adjacentQuote) {
+                    const normalizedTexts = resolvedFacts.map(normalizedFactText);
+                    if (normalizedTexts.every((t): t is string => t !== undefined)) {
+                        const anyMatches = normalizedTexts.some((t) => quoteSupportedByText(adjacentQuote.segments, t));
+                        if (!anyMatches) groupFactViolation = true;
+                    }
+                }
+            }
+        }
+
+        MESSAGE_REF_CITATION_RE.lastIndex = 0;
+        let refMatch: RegExpExecArray | null;
+        while ((refMatch = MESSAGE_REF_CITATION_RE.exec(groupText)) !== null) {
+            const index = Number(refMatch[1]);
+            const ungrounded = groundedRefs !== null && !groundedRefs.has(index);
+            const aboveFrontier = maxAllocated !== undefined && maxAllocated > 0 && index > maxAllocated;
+            if (groupFactViolation || ungrounded || aboveFrontier) {
+                invalid.push({
+                    start: gStart + refMatch.index,
+                    end: gStart + refMatch.index + refMatch[0].length,
+                    raw: refMatch[0],
+                });
+            }
+        }
+    }
+    return invalid;
+}
+
+function applySpanReplacements(
+    summary: string,
+    spans: readonly { start: number; end: number; raw: string }[],
+    placeholder: string,
+): string {
+    let out = "";
+    let cursor = 0;
+    for (const span of spans) {
+        out += summary.slice(cursor, span.start) + placeholder;
+        cursor = span.end;
+    }
+    return out + summary.slice(cursor);
+}
+
+/** Verify an existing/reference summary against original message facts (role,
+ *  quoted original text, and session ref frontier) without requiring an
+ *  input-grounding set. Used to stop stale wrong citations in `otherSummaries`
+ *  or child blocks (e.g. `b32 -> b34`) from poisoning newly generated summaries. */
+export function verifyMessageRefCitations(
+    summary: string,
+    messageFacts: ReadonlyMap<number, CitationMessageFact>,
+    maxAllocatedRef?: number,
+): NeutralizeCitationsResult {
+    const spans = findInvalidRefSpans(summary, null, { messageFacts, maxAllocatedRef });
+    if (spans.length === 0) return { summary, neutralized: [] };
+    const neutralized: string[] = [];
+    const seen = new Set<string>();
+    for (const span of spans) {
+        if (!seen.has(span.raw)) { seen.add(span.raw); neutralized.push(span.raw); }
+    }
+    return { summary: applySpanReplacements(summary, spans, UNVERIFIED_REF_PLACEHOLDER), neutralized };
+}
+
+/** Replace message-ref citations in a generated summary that either never
+ *  appeared in authoritative summarizer inputs, exceed the session ref frontier,
+ *  misattribute a user quote/authorization to a non-user message, or fail to
+ *  match an adjacent verbatim quote in the cited original message. Never pushes
+ *  an already-fitting summary over `maxChars`. */
+export function neutralizeUngroundedMessageRefs(
+    summary: string,
+    groundedRefs: ReadonlySet<number>,
+    options: NeutralizeCitationsOptions = {},
+): NeutralizeCitationsResult {
+    const spans = findInvalidRefSpans(summary, groundedRefs, options);
+    if (spans.length === 0) return { summary, neutralized: [] };
+    const neutralized: string[] = [];
+    const seen = new Set<string>();
+    for (const span of spans) {
+        if (!seen.has(span.raw)) { seen.add(span.raw); neutralized.push(span.raw); }
+    }
+    let cleaned = applySpanReplacements(summary, spans, UNVERIFIED_REF_PLACEHOLDER);
+    const cap = options.maxChars;
+    if (cap !== undefined && Number.isFinite(cap) && cap > 0 && cleaned.length > cap) {
+        cleaned = applySpanReplacements(summary, spans, COMPACT_UNVERIFIED_REF_PLACEHOLDER);
+        if (cleaned.length > cap) cleaned = applySpanReplacements(summary, spans, SHORT_UNVERIFIED_REF_PLACEHOLDER);
+    }
+    return { summary: cleaned, neutralized };
 }
 
 /** Describe why an external-summary batch yielded no usable summary (#2484):

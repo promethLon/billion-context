@@ -2,6 +2,7 @@ import {
     BLOCKED_REF,
     countMessageTokens,
     defaultCountTokens,
+    resolveBlockSpan,
     viableRanges,
     type CompressionCore,
     type Config,
@@ -31,7 +32,15 @@ import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { isCodexClient } from "./codex-compact.js";
-import { describeExternalSummaryFailure, summaryLengthBudgetClause } from "./external-summary.js";
+import {
+    buildCitationMessageIndex,
+    collectGroundedMessageRefs,
+    describeExternalSummaryFailure,
+    highestAllocatedMessageRef,
+    neutralizeUngroundedMessageRefs,
+    summaryLengthBudgetClause,
+    verifyMessageRefCitations,
+} from "./external-summary.js";
 // #3635: the failure description moved to the leaf module next to its data
 // type; re-exported here for importers that historically reached it via preflight.
 export { describeExternalSummaryFailure };
@@ -1349,7 +1358,7 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     // #2952: systemOverride carries a tier-distillation TASK (T2/T3 rules) in
     // place of the default tier-1 TASK; absent → byte-identical default below.
     const system = systemOverride ?? buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections)) +
-        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
+        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Only cite message refs (mNNNNN) that appear verbatim in the segment below; never guess or invent a ref. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
         summaryLengthBudgetClause(lengthBudget, MIN_SUMMARY_CHARS);
     if (deps.externalSummary) {
         const batch = await deps.externalSummary.summarize([{ instructions: system, content, minSummaryChars: MIN_SUMMARY_CHARS,
@@ -2024,6 +2033,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const spanContent = (lo: number, hi: number): string => {
             const cover = new Map<string, string>();
             for (const b of deps.session.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) cover.set(id, b.blockId);
+            const byRaw = deps.session.state?.messageRefs?.byRaw ?? {};
+            const byRef = deps.session.state?.messageRefs?.byRef ?? {};
+            const facts = buildCitationMessageIndex(messages, byRaw, deps.session.contentStore);
+            const maxAllocated = highestAllocatedMessageRef(byRef, facts);
             const parts: string[] = [];
             let i = lo;
             while (i <= hi) {
@@ -2031,10 +2044,20 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 const cid = m ? cover.get(m.id) : undefined;
                 if (cid) {
                     const blk = deps.session.state.blocks.find((x) => x.blockId === cid);
-                    if (blk) parts.push(`[summarized ${blk.topic ? `${blk.blockId}: ${blk.topic}` : blk.blockId}]\n${blk.summary}`);
+                    if (blk) {
+                        const span = resolveBlockSpan(blk, byRaw);
+                        const spanSuffix = span ? ` (${span.startRef}-${span.endRef})` : "";
+                        const label = blk.topic ? `${blk.blockId}${spanSuffix}: ${blk.topic}` : `${blk.blockId}${spanSuffix}`;
+                        const verifiedSummary = verifyMessageRefCitations(blk.summary, facts, maxAllocated).summary;
+                        parts.push(`[summarized ${label}]\n${verifiedSummary}`);
+                    }
                     while (i <= hi) { const mm = messages[i]; if (mm && cover.get(mm.id) === cid) i++; else break; }
                 } else {
-                    if (m) parts.push(`[${m.role}] ${m.text ?? ""}`);
+                    if (m) {
+                        const ref = byRaw[m.id];
+                        const header = ref && ref !== BLOCKED_REF ? `${ref} ${m.role}` : m.role;
+                        parts.push(`[${header}] ${m.text ?? ""}`);
+                    }
                     i++;
                 }
             }
@@ -2107,7 +2130,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const { sourceTier, first, last, lo, hi } = chosen;
             const rules = sourceTier === 1 ? deps.prompts.tier2DistillRules : deps.prompts.tier3CondenseRules;
             const system = buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections))
-                + `\n\n${rules}\n\nTASK: The tier-${sourceTier} block summaries below must be distilled into ONE tier-${sourceTier + 1} summary because the session context exceeds the model window and raw-message folding alone cannot close the gap. Follow every rule above. Output ONLY the distilled summary text — no preamble, no closing remarks, no tool calls.`;
+                + `\n\n${rules}\n\nTASK: The tier-${sourceTier} block summaries below must be distilled into ONE tier-${sourceTier + 1} summary because the session context exceeds the model window and raw-message folding alone cannot close the gap. Follow every rule above. Only cite message refs (mNNNNN) that appear verbatim in the source summaries or messages below; never guess or invent a ref. Output ONLY the distilled summary text — no preamble, no closing remarks, no tool calls.`;
             const content = spanContent(lo, hi);
             const targetKey = previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId);
             if (targetKey === undefined) {
@@ -2142,15 +2165,30 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 stopReason = "unavailable";
                 break;
             }
+            const maxSummary = activeConfig.compress.maxSummaryLength;
+            const distillFacts = buildCitationMessageIndex(messages, deps.session.state?.messageRefs?.byRaw ?? {}, deps.session.contentStore);
+            const distillMaxRef = highestAllocatedMessageRef(deps.session.state?.messageRefs?.byRef ?? {}, distillFacts);
+            const checkedDistill = neutralizeUngroundedMessageRefs(
+                outcome.summary,
+                collectGroundedMessageRefs([content]),
+                {
+                    messageFacts: distillFacts,
+                    maxAllocatedRef: distillMaxRef,
+                    maxChars: maxSummary > 0 ? maxSummary : undefined,
+                },
+            );
+            if (checkedDistill.neutralized.length > 0) {
+                deps.log("warn", `[preflight] neutralized ${checkedDistill.neutralized.length} unverified message ref(s) in tier-${sourceTier}->${sourceTier + 1} distill ${first.blockId}..${last.blockId}: ${checkedDistill.neutralized.join(", ")}`);
+            }
             const ctx: RewriteCtx = { core: deps.core, config: activeConfig, messages, session: deps.session, lastNudge: measuredNudge, log: (m) => deps.log("info", m) };
-            const fold = parseCompressInput({ content: [{ startId: first.blockId, endId: last.blockId, summary: outcome.summary, topic: `preflight tier-${sourceTier + 1} distill (#2952)` }] });
+            const fold = parseCompressInput({ content: [{ startId: first.blockId, endId: last.blockId, summary: checkedDistill.summary, topic: `preflight tier-${sourceTier + 1} distill (#2952)` }] });
             const applied = applyRanges(fold, ctx, { loopTracking: false });
             if (applied.outcome === "refused") {
                 deps.log("warn", `[preflight] tier distillation apply refused: ${safePrefix(applied.text, 200)}; stopping recovery (#2952)`);
                 stopReason = "unavailable";
                 break;
             }
-            deps.session.stats.lastInputTokens += defaultCountTokens(outcome.summary);
+            deps.session.stats.lastInputTokens += defaultCountTokens(checkedDistill.summary);
             const after = measureEst();
             const gained = est - after;
             callsUsed += 1;
@@ -2694,13 +2732,20 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                     : m.contentType === "reasoning"
                                         ? "assistant reasoning"
                                         : m.role;
-                        parts.push(`[${label}]\n${text}`);
+                        const ref = byRaw?.[m.id];
+                        const header = ref && ref !== BLOCKED_REF ? `${ref} ${label}` : label;
+                        parts.push(`[${header}]\n${text}`);
                     }
+                    const batchFacts = buildCitationMessageIndex(messages, deps.session.state?.messageRefs?.byRaw ?? {}, deps.session.contentStore);
+                    const batchMaxRef = highestAllocatedMessageRef(deps.session.state?.messageRefs?.byRef ?? {}, batchFacts);
                     for (const nid of planned.directBlockIds) {
                         const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
                         if (!nb) { droppedParts.push(`child block ${nid} missing from state`); continue; }
-                        const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
-                        parts.push(`[summarized ${label}]\n${nb.summary}`);
+                        const span = byRaw ? resolveBlockSpan(nb, byRaw) : null;
+                        const spanSuffix = span ? ` (${span.startRef}-${span.endRef})` : "";
+                        const label = nb.topic ? `${nb.blockId}${spanSuffix}: ${nb.topic}` : `${nb.blockId}${spanSuffix}`;
+                        const verifiedChildSummary = verifyMessageRefCitations(nb.summary, batchFacts, batchMaxRef).summary;
+                        parts.push(`[summarized ${label}]\n${verifiedChildSummary}`);
                     }
                     if (droppedParts.length > 0) {
                         deps.log("debug", `[preflight] range ${skipKey}: ${droppedParts.length} part(s) rendered nothing (${droppedParts.slice(0, 3).join("; ")})`);
@@ -2729,7 +2774,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const perChunkBudget = maxSummary > 0 ? Math.floor((maxSummary - (chunks.length - 1) * SUMMARY_JOIN_GAP) / chunks.length) : undefined;
                     const instructions =
                         buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections)) +
-                        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
+                        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Only cite message refs (mNNNNN) that appear verbatim in the segment below; never guess or invent a ref. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
                         summaryLengthBudgetClause(perChunkBudget, MIN_SUMMARY_CHARS);
                     nominations.push({ skipKey, startRef, endRef, content, chunks, instructions, effectiveMessageIds: [...planned.effectiveMessageIds], targetKey: foldTargetKey(planned, deps.session.state), spanUnits, offset: workTotal });
                     workTotal += chunks.length;
@@ -2738,15 +2783,31 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     summaryCalls += reservedCalls;
                     const workItems = nominations.flatMap((nom) => nom.chunks.map((chunk) => ({ content: chunk, instructions: nom.instructions, minSummaryChars: MIN_SUMMARY_CHARS, maxSummaryChars: deps.config.compress.maxSummaryLength })));
                     const batch = await batchPlan.summarize(workItems, deps.signal);
+                    const batchByRaw = deps.session.state?.messageRefs?.byRaw ?? {};
+                    const batchMessageFacts = buildCitationMessageIndex(messages, batchByRaw, deps.session.contentStore);
+                    const batchMaxAllocated = highestAllocatedMessageRef(deps.session.state?.messageRefs?.byRef ?? {}, batchMessageFacts);
                     const assembled = nominations.map((nom): string | undefined => {
                         const entries = batch.results.slice(nom.offset, nom.offset + nom.chunks.length);
                         if (entries.length < nom.chunks.length || entries.some((entry) => entry.status !== "success")) return undefined;
-                        const candidate = entries.map((entry) => (entry.status === "success" ? entry.summary : "")).join("\n\n");
+                        const maxSummary = activeConfig.compress.maxSummaryLength;
+                        const rawCandidate = entries.map((entry) => (entry.status === "success" ? entry.summary : "")).join("\n\n");
+                        const checked = neutralizeUngroundedMessageRefs(
+                            rawCandidate,
+                            collectGroundedMessageRefs([nom.content, nom.startRef, nom.endRef, ...nom.effectiveMessageIds.map((id) => batchByRaw[id])]),
+                            {
+                                messageFacts: batchMessageFacts,
+                                maxAllocatedRef: batchMaxAllocated,
+                                maxChars: maxSummary > 0 ? maxSummary : undefined,
+                            },
+                        );
+                        if (checked.neutralized.length > 0) {
+                            deps.log("warn", `[preflight] neutralized ${checked.neutralized.length} unverified message ref(s) in ${nom.skipKey}: ${checked.neutralized.join(", ")}`);
+                        }
+                        const candidate = checked.summary;
                         // Acceptance identical to the walk: absolute cap, then net-
                         // shrink monotonicity (#861/#1775/#1819), rescue-truncate
                         // when truncating still nets savings.
                         const shrinkOk = (text: string): boolean => countText(text) <= nom.spanUnits * NET_SHRINK_TOLERANCE;
-                        const maxSummary = activeConfig.compress.maxSummaryLength;
                         if (maxSummary <= 0 || candidate.length <= maxSummary) {
                             return shrinkOk(candidate) ? candidate : undefined;
                         }
@@ -2968,17 +3029,24 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                               : m.contentType === "reasoning"
                                 ? "assistant reasoning"
                                 : m.role;
-                    parts.push(`[${label}]\n${text}`);
+                    const ref = byRaw?.[m.id];
+                    const header = ref && ref !== BLOCKED_REF ? `${ref} ${label}` : label;
+                    parts.push(`[${header}]\n${text}`);
                     if (emergencyFold) entries.push({ ref: maps.idxToRef.get(i) ?? "?", label, text });
                 }
+                const serialFacts = buildCitationMessageIndex(messages, byRaw ?? {}, deps.session.contentStore);
+                const serialMaxRef = highestAllocatedMessageRef(deps.session.state?.messageRefs?.byRef ?? {}, serialFacts);
                 for (const nid of planned.directBlockIds) {
                     const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
                     // The child stays a summary: its raw text is already condensed, and
                     // re-expanding it would defeat the compression this fold performs.
                     if (!nb) { droppedParts.push(`child block ${nid} missing from state`); continue; }
-                    const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
-                    parts.push(`[summarized ${label}]\n${nb.summary}`);
-                    if (emergencyFold) entries.push({ ref: nb.blockId, label: `summarized ${label}`, text: nb.summary });
+                    const span = byRaw ? resolveBlockSpan(nb, byRaw) : null;
+                    const spanSuffix = span ? ` (${span.startRef}-${span.endRef})` : "";
+                    const label = nb.topic ? `${nb.blockId}${spanSuffix}: ${nb.topic}` : `${nb.blockId}${spanSuffix}`;
+                    const verifiedChildSummary = verifyMessageRefCitations(nb.summary, serialFacts, serialMaxRef).summary;
+                    parts.push(`[summarized ${label}]\n${verifiedChildSummary}`);
+                    if (emergencyFold) entries.push({ ref: nb.blockId, label: `summarized ${label}`, text: verifiedChildSummary });
                 }
                 if (droppedParts.length > 0) {
                     deps.log("debug", `[preflight] range ${skipKey}: ${droppedParts.length} part(s) rendered nothing (${droppedParts.slice(0, 3).join("; ")})`);
@@ -3060,7 +3128,20 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             parts.push(part.summary);
                         }
                         if (!budgetHit && !outcome && parts.length === chunks.length) {
-                            const candidate = parts.join("\n\n");
+                            const rawCandidate = parts.join("\n\n");
+                            const checked = neutralizeUngroundedMessageRefs(
+                                rawCandidate,
+                                collectGroundedMessageRefs([content, startRef, endRef, ...planned.effectiveMessageIds.map((id) => byRaw?.[id])]),
+                                {
+                                    messageFacts: serialFacts,
+                                    maxAllocatedRef: serialMaxRef,
+                                    maxChars: maxSummary > 0 ? maxSummary : undefined,
+                                },
+                            );
+                            if (checked.neutralized.length > 0) {
+                                deps.log("warn", `[preflight] neutralized ${checked.neutralized.length} unverified message ref(s) in ${skipKey}: ${checked.neutralized.join(", ")}`);
+                            }
+                            const candidate = checked.summary;
                             // #861: a summary the kernel would reject on length wastes the apply
                             // attempt and its failure log — route it through the same
                             // halving/skip path as any unusable output. #1775: except when
